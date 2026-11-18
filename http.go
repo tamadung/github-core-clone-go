@@ -109,9 +109,12 @@ func readRequest(br *bufio.Reader, bw *bufio.Writer) (*Request, error) {
 	if idx := strings.Index(target, "?"); idx >= 0 {
 		path, query = target[:idx], target[idx+1:]
 	}
-	decoded, derr := url.PathUnescape(path)
-	if derr == nil {
-		path = decoded
+	// Percent-decoding only matters when the path actually contains '%';
+	// most workload paths are already clean, so skip the allocation.
+	if strings.IndexByte(path, '%') >= 0 {
+		if decoded, derr := url.PathUnescape(path); derr == nil {
+			path = decoded
+		}
 	}
 	req := &Request{
 		Method:  method,
@@ -220,42 +223,83 @@ var reasonPhrases = map[int]string{
 	500: "Internal Server Error",
 }
 
+// writeResponse writes the status line and headers straight into the
+// buffered writer (no intermediate strings.Builder allocation/copy), then
+// the body. Header order for Extra is map order, as before.
 func writeResponse(bw *bufio.Writer, req *Request, resp *Response) error {
 	reason, ok := reasonPhrases[resp.Status]
 	if !ok {
 		reason = "OK"
 	}
-	var sb strings.Builder
-	sb.WriteString("HTTP/1.1 ")
-	sb.WriteString(strconv.Itoa(resp.Status))
-	sb.WriteByte(' ')
-	sb.WriteString(reason)
-	sb.WriteString("\r\n")
-	if resp.ContentType != "" {
-		sb.WriteString("Content-Type: ")
-		sb.WriteString(resp.ContentType)
-		sb.WriteString("\r\n")
+	w := func(s string) error {
+		_, err := bw.WriteString(s)
+		return err
 	}
-	sb.WriteString("Content-Length: ")
+	if err := w("HTTP/1.1 "); err != nil {
+		return err
+	}
+	if err := w(strconv.Itoa(resp.Status)); err != nil {
+		return err
+	}
+	if err := w(" "); err != nil {
+		return err
+	}
+	if err := w(reason); err != nil {
+		return err
+	}
+	if err := w("\r\n"); err != nil {
+		return err
+	}
+	if resp.ContentType != "" {
+		if err := w("Content-Type: "); err != nil {
+			return err
+		}
+		if err := w(resp.ContentType); err != nil {
+			return err
+		}
+		if err := w("\r\n"); err != nil {
+			return err
+		}
+	}
+	if err := w("Content-Length: "); err != nil {
+		return err
+	}
 	if resp.NoBody {
-		sb.WriteString("0\r\n")
+		if err := w("0\r\n"); err != nil {
+			return err
+		}
 	} else {
-		sb.WriteString(strconv.Itoa(len(resp.Body)))
-		sb.WriteString("\r\n")
+		if err := w(strconv.Itoa(len(resp.Body))); err != nil {
+			return err
+		}
+		if err := w("\r\n"); err != nil {
+			return err
+		}
 	}
 	for k, v := range resp.Extra {
-		sb.WriteString(k)
-		sb.WriteString(": ")
-		sb.WriteString(v)
-		sb.WriteString("\r\n")
+		if err := w(k); err != nil {
+			return err
+		}
+		if err := w(": "); err != nil {
+			return err
+		}
+		if err := w(v); err != nil {
+			return err
+		}
+		if err := w("\r\n"); err != nil {
+			return err
+		}
 	}
 	if req.Close {
-		sb.WriteString("Connection: close\r\n")
+		if err := w("Connection: close\r\n"); err != nil {
+			return err
+		}
 	} else {
-		sb.WriteString("Connection: keep-alive\r\n")
+		if err := w("Connection: keep-alive\r\n"); err != nil {
+			return err
+		}
 	}
-	sb.WriteString("\r\n")
-	if _, err := bw.WriteString(sb.String()); err != nil {
+	if err := w("\r\n"); err != nil {
 		return err
 	}
 	if !resp.NoBody && len(resp.Body) > 0 {

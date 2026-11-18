@@ -395,26 +395,44 @@ func fetchPackSet(repo *Repo, plan fetchPlan) (objects []GitObject, boundary, un
 	return objects, boundary, unshallow
 }
 
-// packForFetch is the pack for a fetch plan, cached per repo: clones of the
-// same tip repeat.
-func packForFetch(repo *Repo, plan fetchPlan, objects []GitObject) []byte {
+// cachedFetch is one fetch plan's full result: the pack plus the shallow and
+// unshallow lines the response must repeat. Caching the whole result (not
+// just the pack) lets a repeated fetch skip the graph walk in fetchPackSet
+// entirely — clones of the same tip repeat, so the walk is pure waste.
+type cachedFetch struct {
+	pack      []byte
+	boundary  []string
+	unshallow []string
+}
+
+// fetchCacheKey identifies a fetch plan: the wanted tips, depth, and what the
+// client already holds. Sorted so the same plan always keys the same way.
+func fetchCacheKey(plan fetchPlan) string {
 	wants := append([]string{}, plan.wants...)
 	sort.Strings(wants)
 	haves := append([]string{}, plan.haves...)
 	sort.Strings(haves)
 	shallow := append([]string{}, plan.oldShallow...)
 	sort.Strings(shallow)
-	key := fmt.Sprintf("%s|%d|%s|%s", strings.Join(wants, ","), plan.depth, strings.Join(haves, ","), strings.Join(shallow, ","))
-	if cached, ok := repo.ClonePack[key]; ok {
-		return cached
+	return fmt.Sprintf("%s|%d|%s|%s", strings.Join(wants, ","), plan.depth, strings.Join(haves, ","), strings.Join(shallow, ","))
+}
+
+// fetchCached returns the pack, boundary, and unshallow lines for a plan,
+// computing them (graph walk + pack write) only on a cache miss. A cache hit
+// skips fetchPackSet entirely.
+func fetchCached(repo *Repo, plan fetchPlan) (pack []byte, boundary, unshallow []string) {
+	key := fetchCacheKey(plan)
+	if c, ok := repo.ClonePack[key]; ok {
+		return c.pack, c.boundary, c.unshallow
 	}
-	pack := writePack(objects)
-	repo.ClonePack[key] = pack
-	return pack
+	objects, boundary, unshallow := fetchPackSet(repo, plan)
+	pack = writePack(objects)
+	repo.ClonePack[key] = cachedFetch{pack: pack, boundary: boundary, unshallow: unshallow}
+	return pack, boundary, unshallow
 }
 
 func fetchV2Response(repo *Repo, plan fetchPlan) []byte {
-	objects, boundary, unshallow := fetchPackSet(repo, plan)
+	pack, boundary, unshallow := fetchCached(repo, plan)
 	var parts [][]byte
 	var ackLines []pktItem
 	ackLines = append(ackLines, pktData("acknowledgments\n"))
@@ -458,7 +476,6 @@ func fetchV2Response(repo *Repo, plan fetchPlan) []byte {
 		parts = append(parts, encodePktLines(lines))
 	}
 	parts = append(parts, encodePktLines([]pktItem{pktData("packfile\n")}))
-	pack := packForFetch(repo, plan, objects)
 	for _, chunk := range sidebandChunks(1, pack) {
 		parts = append(parts, chunk)
 	}
@@ -467,7 +484,7 @@ func fetchV2Response(repo *Repo, plan fetchPlan) []byte {
 }
 
 func fetchV0Response(repo *Repo, plan fetchPlan) []byte {
-	objects, boundary, unshallow := fetchPackSet(repo, plan)
+	pack, boundary, unshallow := fetchCached(repo, plan)
 	var parts [][]byte
 	var ackLines []pktItem
 	if len(plan.haves) > 0 {
@@ -491,7 +508,6 @@ func fetchV0Response(repo *Repo, plan fetchPlan) []byte {
 		ackLines = append(ackLines, pktData("unshallow "+oid+"\n"))
 	}
 	parts = append(parts, encodePktLines(ackLines))
-	pack := packForFetch(repo, plan, objects)
 	for _, chunk := range sidebandChunks(1, pack) {
 		parts = append(parts, chunk)
 	}

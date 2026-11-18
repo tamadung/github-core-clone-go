@@ -83,7 +83,7 @@ type Repo struct {
 	// Caches, invalidated on push / mutation.
 	AdvV0Up     []byte
 	AdvRecv     []byte
-	ClonePack   map[string][]byte
+	ClonePack   map[string]cachedFetch
 	LsRefsCache map[string][]byte
 	IssueJSON   map[int][]byte
 }
@@ -157,7 +157,7 @@ func (s *Store) createRepo(name, description string, isPrivate bool) *Repo {
 		PullSeq:       1,
 		LabelSeq:      1,
 		CommentSeq:    1,
-		ClonePack:     make(map[string][]byte),
+		ClonePack:     make(map[string]cachedFetch),
 		LsRefsCache:   make(map[string][]byte),
 		IssueJSON:     make(map[int][]byte),
 	}
@@ -208,7 +208,7 @@ func (s *Store) repoOwner(repo *Repo) string {
 func (s *Store) invalidateGitCaches(repo *Repo) {
 	repo.AdvV0Up = nil
 	repo.AdvRecv = nil
-	repo.ClonePack = make(map[string][]byte)
+	repo.ClonePack = make(map[string]cachedFetch)
 	repo.LsRefsCache = make(map[string][]byte)
 }
 

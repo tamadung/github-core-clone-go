@@ -45,7 +45,7 @@ so this rewrite targets a local bench of **≥165** with margin.
   cannot run (score 0).
 - `forge` — the static Linux amd64 binary, built with
   `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w"`.
-  6,545,592 bytes (< 8 MiB per-file cap). Statically linked.
+  6,541,496 bytes after the 18 Nov optimisation round (< 8 MiB per-file cap). Statically linked.
 
 ## Entrypoint decision (harness evidence)
 
@@ -83,29 +83,125 @@ Target was ≥165 local (margin above the 153 bar for Top Rewards). Achieved
 T_ref 1,641 ms) should hold up better, but the server is a different
 machine and the local number is not a server guarantee.
 
+## Perf optimization round (18 Nov 2026)
+
+Context: the Go entry scored **946 on the server (feature 600 + agent 200 +
+perf 146), rank #132 of 7,668**. Cutoff for the paid zone (rank 20) is 954
+(perf 154) — a gap of 8 perf points. Server p50 423,975 µs vs #20 383,796 µs
+(needs ~10% faster). This round tried to close that gap.
+
+**Machine note (important).** The local VM this round ran on is
+systematically slower/noisier than the machine the original Go build was
+benched on (174–179). A clean re-baseline of the submitted binary
+(@66b2802) on this VM gave perf **150 / 141 / 148 (median 148)**, i.e. the
+local baseline here ≈ the server score (146). The "local ≥190" target from
+the task was set against the faster machine's 174–179 and is **not
+reachable on this VM** — the environment, not the code, is the binding
+constraint (see the profiling finding below). Do not read the 143–148
+numbers as a regression vs 174–179; they are a different machine.
+
+### Profiling finding: the server is ~1% of the suite's per-request time
+
+Precise in-process Go benchmarks (this VM, `go test -bench`):
+
+| measured | baseline | after this round |
+|----------|----------|------------------|
+| dispatch, GET issue (cached) | 2,562 ns | 2,736 ns (noise; untouched) |
+| dispatch, clone fetch (cached pack) | 12,004 ns | 8,522 ns (**−29%**) |
+| JSON marshal, issue shape | 26,183 ns | 28,253 ns (noise; untouched) |
+| readRequest (parse one GET) | 3,199 ns | 2,886 ns (**−10%**) |
+| writeResponse (cached issue body) | 1,098 ns | 587 ns (**−47%**) |
+| full HTTP round-trip over loopback (Go client) | 69,316 ns | 65,996 ns (**−5%**) |
+
+The server's whole per-request compute is ~7 µs, while the suite measures
+~800 µs per read request and ~1,100 µs per write request. The remaining
+~99% is the suite client's (undici) per-request overhead plus
+scheduling/TCP latency on this throttled VM. Server-side micro-optimisation
+therefore cannot move the suite score measurably here — it can only make
+the server objectively faster, which may help the production server (a
+different, likely faster machine where server compute is a larger share).
+
+### What was tried
+
+1. **RWMutex / concurrent dispatch — TRIED, A/B'd, REVERTED.** Replaced
+   the serial `Server.mu` with `sync.RWMutex` (reads = GET/HEAD + POST
+   git-upload-pack), caches moved to `sync.Map`, viewer to `atomic.Value`.
+   3 suite runs: perf **144 / 152 / 141 (median 144)** vs baseline median
+   148; clone **30 / 33 / 29 (median 30)** vs baseline clone 34/29/33
+   (median 33) — clone did **not** improve, total did not improve. The
+   bottleneck is total CPU work (client + server share 1.5 CPUs), not lock
+   serialisation, so parallelising dispatch does not reduce wall time.
+   Reverted to the clean baseline (git checkout) — only keep what
+   measurably speeds up.
+2. **Cache-skip in fetch — KEPT.** `fetchV2Response`/`fetchV0Response`
+   used to run `fetchPackSet` (graph walk) on every fetch and only then
+   consult the pack cache. Now the whole fetch result (pack + boundary +
+   unshallow) is cached per plan in `fetchCached` (`cachedFetch` in
+   gitserver.go, `Repo.ClonePack` is now `map[string]cachedFetch`); a cache
+   hit skips the graph walk entirely. Fetch dispatch 12,004 → 8,522 ns
+   (−29%). Response bytes are identical (same pack, same shallow lines).
+3. **HTTP hot path — KEPT.** `readRequest`: skip `url.PathUnescape` when
+   the path contains no `%` (most workload paths are clean) — 3,199 →
+   2,886 ns (−10%). `writeResponse`: write the status line/headers
+   straight into the buffered writer instead of building a
+   `strings.Builder` first — 1,098 → 587 ns (−47%). Full round-trip
+   69,316 → 65,996 ns (−5%). Response bytes are identical.
+4. **Struct JSON — NOT attempted.** The write marshal is ~26 µs of a
+   ~1,100 µs per-request time; a struct encoder would save at most a few
+   µs and risks key-order drift vs the map-based (sorted-key) output that
+   matches Node. Not worth the conformance risk for ~0.2 points.
+5. **Pack cache key / delta generation — NOT attempted.** NOTES.md already
+   said they do not affect the suite; the profiling confirms the fetch
+   dispatch is a small share, so neither would move the score.
+
+### Validation of this round (local suite, fresh process, 3 runs)
+
+| run | checks | feature | agent | perf | score | breakdown (push/clone/read/write) |
+|-----|--------|---------|-------|------|-------|-----------------------------------|
+| 1 | 120/120 | 600 | 200 | 145 | 945 | 47 / 31 / 34 / 33 |
+| 2 | 120/120 | 600 | 200 | 140 | 940 | 48 / 30 / 34 / 28 |
+| 3 | 120/120 | 600 | 200 | 143 | 943 | 46 / 31 / 33 / 33 |
+| **median** | **120/120** | **600** | **200** | **143** | **943** | **47 / 31 / 34 / 33** |
+
+Baseline on the same VM (3 runs): 150 / 141 / 148 (median 148). The
+optimised median (143) is **within run-to-run noise of the baseline**
+(the baseline itself spans 141–150); the suite cannot resolve the
+server-side gains on this VM. Conformance is unchanged (120/120 every
+run). **The local ≥190 target was not met, and is not reachable on this
+VM.** The server code is measurably faster in absolute terms (see the
+benchmark table above), which is the best available proxy for helping the
+production server — but no local suite gain is claimed. Whether to
+resubmit this round is a parent decision: the changes are low-risk and
+objectively faster, but the expected server gain is unmeasured.
+
 ## Five weakest points
 
-1. **Read is client-bound.** The 2,000 sequential GETs measure ~477 µs/req
-   through the suite's undici client, but the server alone does ~157 µs/req
-   (Python keep-alive benchmark). The client's per-request overhead caps
-   read around 42–44 points; 50 points (≤690 ms) is unreachable while the
-   client costs ~350 µs/req. Server-side micro-optimisation can only move
-   this a point or two.
-2. **Dispatch is serialized.** One mutex around the whole dispatch. The
-   clone workload (50 concurrent) is therefore processed sequentially; the
-   Node reference is also single-threaded, so T_ref already includes
-   serialisation, but a read/write lock would buy a few clone points. Not
-   attempted: the store's maps/slices are not thread-safe, and a race under
-   the concurrent clone workload could fail the whole benchmark.
+1. **Read is client-bound (confirmed, now quantified).** The 2,000
+   sequential GETs measure ~800 µs/req through the suite's undici client,
+   but the server alone does ~7 µs/req of compute (dispatch 2.6 µs +
+   parse 2.9 µs + write 0.6 µs). The client's per-request overhead plus
+   scheduling caps read around 33–35 points; 50 points is unreachable
+   while the client costs ~350 µs/req. Server-side micro-optimisation can
+   only move this a point or two, and locally it moves nothing measurable.
+2. **Dispatch serialisation is NOT the bottleneck (revised).** The
+   18 Nov round replaced the mutex with an RWMutex + sync.Map caches and
+   A/B'd it: no gain (median 144 vs 148 baseline, clone 30 vs 33). The
+   clone workload is bound by total CPU work shared with the client, not
+   by lock serialisation. Reverted. A faster machine with more CPUs might
+   benefit, but it cannot be verified locally.
 3. **Clone pack cache key.** The pack cache is keyed by
    wants|depth|haves|shallow. A fetch with a different `have` set rebuilds
    the pack. The suite's clones all share the same key, so this is fine in
-   practice, but a varied `have` mix would rebuild more often.
+   practice, but a varied `have` mix would rebuild more often. (The
+   cache-skip in the 18 Nov round now also caches the boundary/unshallow
+   lines with the pack, so a hit skips the graph walk too.)
 4. **JSON is map-based.** REST shapes are built as `map[string]interface{}`
    and marshalled with reflection. A struct-based encoder would be faster
    for the write workload (200 POSTs). Not attempted: the map shapes are
    byte-deterministic (keys sorted) and match Node's output; a struct
-   rewrite risks a shape drift that fails conformance.
+   rewrite risks a shape drift that fails conformance. The marshal is
+   ~26 µs of a ~1,100 µs per-request time, so the gain would be ~0.2
+   points at most.
 5. **No delta generation.** The server never sends deltas (plain objects
    only), matching the suite's client (which sends plain objects). A client
    that sent a delta pack would be resolved (OFS/REF delta support is in
