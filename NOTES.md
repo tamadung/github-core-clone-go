@@ -174,6 +174,88 @@ production server — but no local suite gain is claimed. Whether to
 resubmit this round is a parent decision: the changes are low-risk and
 objectively faster, but the expected server gain is unmeasured.
 
+## Perf optimization round 4 (18 Nov 2026)
+
+Context: round 3 was submitted and scored **954 on the server (feature
+600 + agent 200 + perf 154), p50 382,378 µs, rank #24 / prize #24 of
+7,929**. Ranks 18–26 are tied at 954; the tie-break is p50 (smaller is
+better). **#20 p50 = 378,312 µs — the gap is only ~4,066 µs (~1.1%).**
+Either p50 ≤ ~378,000 µs or +1 perf point (955) puts the entry in the
+paid zone. This round targets that last ~1%.
+
+### What was tried
+
+1. **Struct JSON — KEPT (the main win).** Round 3 estimated the issue
+   marshal at ~26 µs of a ~1,100 µs request and skipped it. A fresh
+   profile on this VM showed the real split is much more favourable:
+   the write dispatch is ~20.7 µs and the issue shape+marshal is
+   ~12 µs of it (~58%). `issueShape`/`userShape`/`labelShape` now have
+   struct twins (`issueJSON`/`userJSON`/`labelJSON`, fields declared in
+   **alphabetical order** so encoding/json emits them in the same order
+   as the map encoder's sorted keys) used by the REST issue/label
+   handlers (list, create, single-GET cache fill, PATCH). The map
+   versions are **kept** for MCP (`mcpOKResult` needs a map for
+   `structuredContent`) and for `repoShape`/`pullShape`/`commentShape`,
+   which embed the shapes in maps. Byte-identical output was verified
+   by `TestIssueShapeByteIdentical` (temporary, in bench_test.go,
+   deleted after verification): 6 cases — open no-label, open with
+   labels + special chars (`"`, `<`, `&`, `\`), open with comments,
+   closed, unicode, empty body — plus user/label shapes. All byte-identical.
+2. **Fast requestID — KEPT.** `fmt.Sprintf("req_%08x", n)` (~163 ns)
+   replaced by a manual 8-hex-digit render into a fixed `[12]byte`
+   buffer (~19 ns, −88%). The format is identical (`req_` + 8 lowercase
+   hex digits); `fmt` is no longer imported by rest.go. Called once per
+   response, so this is a small but free win on every workload.
+3. **RWMutex — NOT repeated.** Round 3 proved it does not help
+   (bottleneck is total CPU, not lock serialisation). Not tried again.
+4. **tsFor fast formatter — NOT attempted.** A custom date formatter
+   would save ~0.4 µs per write POST (2 calls × ~257 ns, minus the
+   replacement's own cost). Too small for the date-correctness risk.
+5. **Struct parseJSONBody / clone / push micro-opts — NOT attempted.**
+   A struct body parse would save ~1 µs per write POST but requires
+   changing `handleRest` + all handlers (invasive). Push is already
+   maxed at 50 points and clone is already cache-optimised; neither has
+   a measured server-side cost worth chasing.
+
+### Profiling (precise in-process Go benchmarks, this VM)
+
+| measured | before (round-3 binary) | after (round 4) |
+|----------|------------------------|-----------------|
+| JSON marshal, issue shape (map) | 8,783 ns | 2,359 ns struct (**−73%**) |
+| issue shape build (map) | 3,261 ns | 1,077 ns struct (**−67%**) |
+| dispatch, POST create issue | 20,656 ns | 9,851 ns (**−52%**) |
+| dispatch, GET issue (cached) | 1,510 ns | 1,191 ns (**−21%**) |
+| requestID | 163 ns | 19 ns (**−88%**) |
+| MarshalIssue (map, reference) | 8,764 ns | unchanged (kept for MCP) |
+
+Write dispatch is down 52% (≈10.8 µs saved per write POST); read
+dispatch is down 21% (≈0.3 µs per GET). The remaining write dispatch
+(~9.9 µs) is `parseJSONBody` ~1.6 µs + shape ~1.1 µs + marshal ~2.4 µs
++ routing/auth/allocations.
+
+### Validation of this round (local suite, fresh process, 4 runs)
+
+| run | checks | feature | agent | perf | score | breakdown (push/clone/read/write) |
+|-----|--------|---------|-------|------|-------|-----------------------------------|
+| r4-1 | 120/120 | 600 | 200 | 179 | 979 | 50 / 42 / 44 / 43 |
+| r4-2 | 120/120 | 600 | 200 | 177 | 977 | 50 / 42 / 43 / 42 |
+| r4-3 | 120/120 | 600 | 200 | 181 | 981 | 50 / 42 / 44 / 45 |
+| r4-final | 120/120 | 600 | 200 | 180 | 980 | 50 / 41 / 44 / 45 |
+| **median** | **120/120** | **600** | **200** | **180** | **980** | **50 / 42 / 44 / 44** |
+
+Round-3 binary on the same VM scored ~141–150 (median 148). **Local perf
+jumped ~+30 points (148 → 180) and the write workload's local p50 fell
+from ~190 ms to ~112–137 ms.** That is a real, repeatable local
+improvement across 4 runs — unlike round 3, where the local score was
+inside noise. The honest caveat still stands: the local suite is
+client-bound and noisy, and the server p50 cannot be measured here, so
+the server gain (whether it closes the ~1.1% gap to #20) is only known
+from the server score after resubmit. But this round has both a
+measurably faster server (write dispatch −52%) **and** a markedly better
+local suite, which round 3 did not. Conformance is unchanged (120/120
+every run). The binary `forge` was rebuilt from the final code and is
+committed.
+
 ## Five weakest points
 
 1. **Read is client-bound (confirmed, now quantified).** The 2,000
@@ -195,13 +277,15 @@ objectively faster, but the expected server gain is unmeasured.
    practice, but a varied `have` mix would rebuild more often. (The
    cache-skip in the 18 Nov round now also caches the boundary/unshallow
    lines with the pack, so a hit skips the graph walk too.)
-4. **JSON is map-based.** REST shapes are built as `map[string]interface{}`
-   and marshalled with reflection. A struct-based encoder would be faster
-   for the write workload (200 POSTs). Not attempted: the map shapes are
-   byte-deterministic (keys sorted) and match Node's output; a struct
-   rewrite risks a shape drift that fails conformance. The marshal is
-   ~26 µs of a ~1,100 µs per-request time, so the gain would be ~0.2
-   points at most.
+4. **JSON was map-based — fixed in round 4 (18 Nov).** REST shapes were
+   built as `map[string]interface{}` and marshalled with reflection.
+   Round 4 added struct twins (`issueJSON`/`userJSON`/`labelJSON`,
+   alphabetical field order) for the REST issue/label handlers, verified
+   byte-identical to the map output across 6 cases; the map versions are
+   kept for MCP (`structuredContent` needs a map) and for
+   `repoShape`/`pullShape`/`commentShape`. Write dispatch fell 52%
+   (20,656 → 9,851 ns), marshal 8,783 → 2,359 ns. See "Perf
+   optimization round 4" above.
 5. **No delta generation.** The server never sends deltas (plain objects
    only), matching the suite's client (which sends plain objects). A client
    that sent a delta pack would be resolved (OFS/REF delta support is in
@@ -215,8 +299,8 @@ objectively faster, but the expected server gain is unmeasured.
 | checks | 120/120 | 120/120 | 120/120 |
 | feature | 600 | 600 | 600 |
 | agent | 200 | 200 | 200 |
-| perf | 165 | 174–179 | 123 |
-| score | ~965 | 974–979 | 923 |
+| perf | 165 | 177–181 | 123 |
+| score | ~965 | 977–981 | 923 |
 
 Go is faster on every workload locally (push 283 vs ~433 ms, clone
 ~108 vs ~?, read ~1,000 vs ~1,137 ms, write ~133 vs ~?). The biggest
